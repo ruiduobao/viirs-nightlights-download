@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""VIIRS Nightlights Downloader - Download VIIRS nighttime light composites."""
+"""VIIRS Nightlights Downloader - Download VIIRS nighttime light composites.
+
+Privacy disclosure
+------------------
+When this script runs, it sends:
+* Date/year queries to EOG/NOAA VNL or NASA LAADS endpoints.
+  No API keys, no local files, no PII are sent.
+
+What is NOT sent: any data from the local filesystem, any environment
+variables, any login credentials.
+
+Public domain notice
+--------------------
+VIIRS nighttime light data is provided by NOAA/EOG and is in the
+**public domain**. This skill does not bypass any authentication,
+login, or access control.
+
+License
+-------
+MIT-0 — No Attribution.
+"""
 
 import argparse
 import json
@@ -133,6 +153,7 @@ class ViirsDownloader:
             "User-Agent": USER_AGENT,
             "Accept": "*/*",
         })
+        self.session.trust_env = False
 
     def search(
         self,
