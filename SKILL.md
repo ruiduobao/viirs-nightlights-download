@@ -1,15 +1,12 @@
 ---
-name: viirs-nightlights-download
-display_name: VIIRS Nightlights Downloader
-version: 0.1.0
-author: rui.duobao
-license: MIT-0
-description: |
-  Download VIIRS nighttime light composite data from public sources
+description: 'Download VIIRS nighttime light composite data from public sources
+
   (EOG/NOAA VNL, NASA LAADS). Supports annual and monthly composites
+
   with regional bbox subsetting.
-runtime: python>=3.8
-tags: [gis, remote-sensing, viirs, nightlights, noaa, eog, earth-observation]
+
+  '
+name: viirs-nightlights-download
 ---
 
 # VIIRS Nightlights Downloader
