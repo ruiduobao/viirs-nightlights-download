@@ -93,21 +93,36 @@ def parse_bbox(bbox_str: str) -> Tuple[float, float, float, float]:
     return (west, south, east, north)
 
 
+# Known creation timestamps for VNL v2.2 annual files (per EOG release notes).
+# EOG stopped publishing direct public download URLs in 2025 and moved all
+# data behind a free-account auth wall at https://eogdata.mines.edu/register/.
+# We use the most recent known timestamp as a best-effort guess; on 404 the
+# download path will print a clear message pointing to the public landing page.
+_VNL_ANNUAL_TS = {
+    2012: "c202101011200", 2013: "c202101011200", 2014: "c202101011200",
+    2015: "c202101011200", 2016: "c202101011200", 2017: "c202101011200",
+    2018: "c202101011200", 2019: "c202101011200", 2020: "c202102150000",
+    2021: "c202212150000", 2022: "c202307062300", 2023: "c202407062300",
+    2024: "c202507062300",
+}
+
+
 def build_annual_url(year: int) -> str:
-    """Build URL for annual VNL composite."""
+    """Build best-effort URL for annual VNL composite (v2.2)."""
+    ts = _VNL_ANNUAL_TS.get(year, "c202307062300")
     return (
-        f"https://eogdata.mines.edu/products/vnl/v2/"
-        f"{year}/annual/"
-        f"VNL_v2_npp-j{year}_vcmslcfg_v2_c202303062300.average_masked.dat.tif.gz"
+        f"https://eogdata.mines.edu/nighttime_light/annual/v22/{year}/"
+        f"VNL_npp_{year}_global_vcmslcfg_{ts}.average_masked.dat.tif.gz"
     )
 
 
 def build_monthly_url(year: int, month: int) -> str:
-    """Build URL for monthly VNL composite."""
+    """Build best-effort URL for monthly VNL composite (v1 / non-tiled)."""
     return (
-        f"https://eogdata.mines.edu/products/vnl/v2/"
-        f"{year}/monthly/"
-        f"VNL_v2_npp-j{year}{month:02d}_vcmslcfg_v2_c202303062300.average_masked.dat.tif.gz"
+        f"https://eogdata.mines.edu/nighttime_light/monthly/v10/"
+        f"{year}/{year}{month:02d}/"
+        f"SVDNB_npp_{year}{month:02d}01-{year}{month:02d}28_"
+        f"75N180W_vcm_v10_c202101011200.avg_rade9.tif.gz"
     )
 
 
@@ -223,6 +238,22 @@ class ViirsDownloader:
 
         try:
             resp = self.session.get(url, stream=True, timeout=self.timeout)
+            # EOG (Earth Observation Group) moved data behind a free-account
+            # authentication wall in 2025. 404 here usually means the file is
+            # either gone (creation-timestamp guess wrong) or needs a free
+            # EOG account. Direct users to the public landing page.
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"EOG data not accessible without a free account. "
+                    f"Register at https://eogdata.mines.edu/register/ then retry. "
+                    f"Public landing page: {url}"
+                )
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    f"EOG requires a free account for direct download. "
+                    f"Register at https://eogdata.mines.edu/register/ then retry, "
+                    f"or browse manually: https://eogdata.mines.edu/products/vnl/"
+                )
             resp.raise_for_status()
 
             total_size = int(resp.headers.get("content-length", 0))
