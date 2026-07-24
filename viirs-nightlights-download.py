@@ -327,6 +327,10 @@ def cmd_search(args):
 
 def cmd_download(args):
     """Handle download command."""
+    if not validate_year(args.year):
+        print(f"Error: Year must be between {MIN_YEAR} and {MAX_YEAR}", file=sys.stderr)
+        return 1
+
     downloader = ViirsDownloader(
         output_dir=args.output_dir or ".",
         timeout=args.timeout,
