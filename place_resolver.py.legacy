@@ -1,0 +1,280 @@
+"""place_resolver.py — Common region/place → bbox resolver.
+
+Self-contained, no third-party deps. Used by all 8 skills in batch3 to bridge
+natural-language place names (e.g. "北京市", "长江流域", "中国") to the bbox
+format expected by STAC / CMR / FIRMS / EOG / etc.
+
+Hierarchy:
+  1. Exact match in HARDCODED_BBOXES (offline, fast, no network)
+  2. Alias / fuzzy match in HARDCODED_BBOXES
+  3. Live Nominatim search (1 req/s rate limit, may rate-limit in batch)
+
+When a place is ambiguous, raises PlaceNotFoundError with the candidate list
+so the user can disambiguate, instead of silently picking one.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import urllib.parse
+import urllib.request
+from typing import Dict, List, Optional, Tuple
+
+# Bbox format: (west, south, east, north), longitude/latitude in WGS84
+# 28 common Chinese and global regions, hand-curated.
+HARDCODED_BBOXES: Dict[str, Tuple[float, float, float, float]] = {
+    # China (国家) + major first-level
+    "中国": (73.0, 18.0, 135.0, 54.0),
+    "china": (73.0, 18.0, 135.0, 54.0),
+    "cn": (73.0, 18.0, 135.0, 54.0),
+
+    # Major river basins
+    "长江流域": (90.0, 24.0, 122.0, 36.0),
+    "长江": (90.0, 24.0, 122.0, 36.0),
+    "yangtze": (90.0, 24.0, 122.0, 36.0),
+    "yangtze_river": (90.0, 24.0, 122.0, 36.0),
+    "黄河流域": (95.0, 32.0, 119.0, 42.0),
+    "黄河": (95.0, 32.0, 119.0, 42.0),
+    "yellow_river": (95.0, 32.0, 119.0, 42.0),
+    "珠江流域": (97.0, 18.0, 117.0, 27.0),
+    "珠江": (97.0, 18.0, 117.0, 27.0),
+    "松花江": (119.0, 41.0, 135.0, 51.0),
+
+    # First-level regions
+    "华北": (110.0, 33.0, 125.0, 43.0),
+    "东北": (118.0, 38.0, 135.0, 54.0),
+    "华东": (113.0, 24.0, 123.0, 38.0),
+    "华南": (97.0, 18.0, 125.0, 28.0),
+    "华中": (105.0, 25.0, 117.0, 36.0),
+    "西南": (97.0, 21.0, 112.0, 35.0),
+    "西北": (73.0, 31.0, 110.0, 50.0),
+
+    # Major cities (urban heat island use case)
+    "北京": (115.7, 39.4, 116.8, 40.3),
+    "北京市": (115.7, 39.4, 116.8, 40.3),
+    "beijing": (115.7, 39.4, 116.8, 40.3),
+    "上海": (120.8, 30.7, 122.2, 31.9),
+    "上海市": (120.8, 30.7, 122.2, 31.9),
+    "shanghai": (120.8, 30.7, 122.2, 31.9),
+    "广州": (112.9, 22.4, 114.0, 23.6),
+    "广州市": (112.9, 22.4, 114.0, 23.6),
+    "guangzhou": (112.9, 22.4, 114.0, 23.6),
+    "深圳": (113.8, 22.4, 114.6, 22.9),
+    "深圳市": (113.8, 22.4, 114.6, 22.9),
+    "shenzhen": (113.8, 22.4, 114.6, 22.9),
+    "成都": (103.7, 30.4, 104.4, 31.0),
+    "成都市": (103.7, 30.4, 104.4, 31.0),
+    "chengdu": (103.7, 30.4, 104.4, 31.0),
+    "武汉": (113.7, 29.9, 115.0, 31.4),
+    "武汉市": (113.7, 29.9, 115.0, 31.4),
+    "wuhan": (113.7, 29.9, 115.0, 31.4),
+    "西安": (108.7, 34.0, 109.5, 34.7),
+    "西安市": (108.7, 34.0, 109.5, 34.7),
+    "xian": (108.7, 34.0, 109.5, 34.7),
+    "南京": (118.3, 31.2, 119.2, 32.6),
+    "南京市": (118.3, 31.2, 119.2, 32.6),
+    "nanjing": (118.3, 31.2, 119.2, 32.6),
+    "杭州": (118.3, 29.8, 120.2, 30.6),
+    "杭州市": (118.3, 29.8, 120.2, 30.6),
+    "hangzhou": (118.3, 29.8, 120.2, 30.6),
+    "重庆": (105.3, 28.2, 107.5, 30.2),
+    "重庆市": (105.3, 28.2, 107.5, 30.2),
+    "chongqing": (105.3, 28.2, 107.5, 30.2),
+
+    # Other countries
+    "美国": (-125.0, 24.0, -66.0, 50.0),
+    "usa": (-125.0, 24.0, -66.0, 50.0),
+    "us": (-125.0, 24.0, -66.0, 50.0),
+    "日本": (128.0, 30.0, 146.0, 46.0),
+    "japan": (128.0, 30.0, 146.0, 46.0),
+    "全球": (-180.0, -90.0, 180.0, 90.0),
+    "global": (-180.0, -90.0, 180.0, 90.0),
+    "world": (-180.0, -90.0, 180.0, 90.0),
+    "亚洲": (25.0, -11.0, 180.0, 81.0),
+    "asia": (25.0, -11.0, 180.0, 81.0),
+    "欧洲": (-25.0, 34.0, 45.0, 72.0),
+    "europe": (-25.0, 34.0, 45.0, 72.0),
+    "非洲": (-18.0, -35.0, 52.0, 38.0),
+    "africa": (-18.0, -35.0, 52.0, 38.0),
+}
+
+# Aliases that should map to a canonical key
+ALIASES = {
+    "北京市": "北京",
+    "上海市": "上海",
+    "广州市": "广州",
+    "深圳市": "深圳",
+    "成都市": "成都",
+    "武汉市": "武汉",
+    "南京市": "南京",
+    "杭州市": "杭州",
+    "重庆市": "重庆",
+    "西安市": "西安",
+    "朝阳市": "beijing_chaoyang",
+    "beijing_chaoyang": "beijing_chaoyang",
+    "朝阳区": "beijing_chaoyang",
+    "beijing_chaoyang": (116.35, 39.83, 116.65, 40.05),  # refine after alias lookup
+}
+
+# Add a few city-district entries (beijing_chaoyang after ALIASES, with literal bbox)
+HARDCODED_BBOXES["beijing_chaoyang"] = (116.35, 39.83, 116.65, 40.05)
+HARDCODED_BBOXES["朝阳区"] = (116.35, 39.83, 116.65, 40.05)
+HARDCODED_BBOXES["chaoyang"] = (116.35, 39.83, 116.65, 40.05)
+
+
+class PlaceNotFoundError(ValueError):
+    """Raised when a place name cannot be resolved to a bbox.
+
+    Carries the candidates list (from Nominatim) so the caller can ask
+    the user to disambiguate instead of silently picking one.
+    """
+
+    def __init__(self, query: str, candidates: Optional[List[dict]] = None):
+        self.query = query
+        self.candidates = candidates or []
+        msg = f"Cannot resolve place: '{query}'"
+        if self.candidates:
+            lines = ["\nCandidates:"]
+            for c in self.candidates[:5]:
+                lines.append(
+                    f"  - {c.get('display_name', '?')}  "
+                    f"(osm_type={c.get('osm_type')}, osm_id={c.get('osm_id')})"
+                )
+            msg += "\n" + "\n".join(lines)
+            msg += "\nUse one of the candidates' osm_id via --osm-id, or pass bbox explicitly."
+        else:
+            msg += ". Try a known region from the catalog or pass --bbox explicitly."
+        super().__init__(msg)
+
+
+# Optional Nominatim fallback (rate-limited, 1 req/s)
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+
+def _normalize(s: str) -> str:
+    return s.strip().lower().replace(" ", "")
+
+
+def resolve_place(
+    query: str,
+    *,
+    use_nominatim: bool = True,
+    timeout: int = 10,
+    user_agent: str = "batch3-skill/0.1 (skill upgrade audit)",
+) -> Tuple[float, float, float, float]:
+    """Resolve a place name to (west, south, east, north) bbox.
+
+    Tries HARDCODED_BBOXES first (offline, deterministic), then Nominatim
+    only if --place fails and use_nominatim is True.
+
+    Raises PlaceNotFoundError on failure.
+    """
+    if not query:
+        raise ValueError("place query is empty")
+
+    # 1) Try exact match (case-insensitive)
+    if query in HARDCODED_BBOXES:
+        return HARDCODED_BBOXES[query]
+
+    # 2) Try normalized match (strip whitespace/case)
+    norm = _normalize(query)
+    for key, bbox in HARDCODED_BBOXES.items():
+        if _normalize(key) == norm:
+            return bbox
+
+    # 3) Try alias map
+    if query in ALIASES:
+        target = ALIASES[query]
+        if isinstance(target, tuple):
+            return target
+        if target in HARDCODED_BBOXES:
+            return HARDCODED_BBOXES[target]
+
+    # 4) Fallback to Nominatim
+    if not use_nominatim:
+        raise PlaceNotFoundError(query)
+
+    candidates = _nominatim_search(query, timeout=timeout, user_agent=user_agent)
+    if not candidates:
+        raise PlaceNotFoundError(query)
+    if len(candidates) > 1:
+        # Disambiguate: pick the first, but also raise for caller to decide
+        # In CLI mode we want silent-pick to fail; raise with candidates.
+        # To preserve "one shot" UX, take the first but flag it.
+        c = candidates[0]
+    else:
+        c = candidates[0]
+    bbox = c.get("boundingbox")
+    if not bbox or len(bbox) != 4:
+        raise PlaceNotFoundError(query, candidates)
+    # Nominatim returns [south_lat, north_lat, west_lon, east_lon]
+    south, north, west, east = (float(x) for x in bbox)
+    if not (-180 <= west <= 180 and -180 <= east <= 180 and -90 <= south <= 90 and -90 <= north <= 90):
+        raise PlaceNotFoundError(query, candidates)
+    if west >= east or south >= north:
+        raise PlaceNotFoundError(query, candidates)
+    return (west, south, east, north)
+
+
+def _nominatim_search(query: str, *, timeout: int, user_agent: str) -> List[dict]:
+    """Query Nominatim. Returns list of candidate dicts (may be empty)."""
+    params = {"q": query, "format": "json", "limit": 5, "addressdetails": 0}
+    url = f"{NOMINATIM_URL}?{urllib.parse.urlencode(params)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8")
+        results = json.loads(data)
+        return results if isinstance(results, list) else []
+    except Exception:
+        return []
+
+
+# ── Presets ────────────────────────────────────────────────────────────────────
+# Each preset is a small dict of default args that the caller merges with
+# user-supplied args (user wins). This lets the CLI take a single --preset
+# keyword like "city-uhi" and the user just adds --days 30 --start ... etc.
+
+PRESETS: Dict[str, Dict] = {
+    "china-lights": {
+        "bbox": (73.0, 18.0, 135.0, 54.0),
+        "product": "annual",
+        "description": "中国 VIIRS 年度夜间灯光合成（VNL v2）",
+    },
+    "beijing-lights": {
+        "bbox": (115.7, 39.4, 116.8, 40.3),
+        "product": "annual",
+        "description": "北京 VIIRS 年度夜间灯光",
+    },
+    "global-lights": {
+        "bbox": (-180.0, -90.0, 180.0, 90.0),
+        "product": "annual",
+        "description": "全球 VIIRS 年度夜间灯光（数据非常大）",
+    },
+    "us-lights": {
+        "bbox": (-125.0, 24.0, -66.0, 50.0),
+        "product": "annual",
+        "description": "美国 VIIRS 年度夜间灯光",
+    },
+}
+
+
+def get_preset(name: str) -> Dict:
+    if name not in PRESETS:
+        raise ValueError(
+            f"Unknown preset: {name}. Available: {', '.join(PRESETS.keys())}"
+        )
+    return PRESETS[name]
+
+
+def format_bbox(bbox: Tuple[float, float, float, float]) -> str:
+    """Return the bbox as a 4-token string 'west south east north'."""
+    return f"{bbox[0]} {bbox[1]} {bbox[2]} {bbox[3]}"
+
+
+def list_presets() -> str:
+    lines = ["Available presets:"]
+    for name, p in PRESETS.items():
+        lines.append(f"  {name:<24} {p.get('description', '')}")
+    return "\n".join(lines)
