@@ -33,6 +33,39 @@ from urllib.parse import urljoin
 import requests
 from tqdm import tqdm
 
+# Local place-resolver (offline-first place name -> bbox lookup, batch3 v0.2.0+)
+try:
+    from place_resolver import (
+        resolve_place,
+        get_preset,
+        list_presets,
+        format_bbox,
+        PlaceNotFoundError,
+        PRESETS,
+    )
+except ImportError as _exc:
+    print(
+        f"Warning: place_resolver.py not found ({_exc}). "
+        "--place/--preset will be unavailable.",
+        file=sys.stderr,
+    )
+    PRESETS = {}
+
+    def resolve_place(*args, **kwargs):
+        raise RuntimeError("place_resolver.py missing — --place not available")
+
+    def get_preset(name):
+        raise ValueError(f"Unknown preset: {name} (place_resolver missing)")
+
+    def list_presets():
+        return "(place_resolver.py missing)"
+
+    def format_bbox(b):
+        return f"{b[0]} {b[1]} {b[2]} {b[3]}"
+
+    class PlaceNotFoundError(ValueError):
+        pass
+
 __version__ = "0.1.0"
 
 MIN_YEAR = 2012
@@ -51,6 +84,31 @@ WORLDVIEW_LAYER = "VIIRS_SNPP_DNB_MONTHLY_AGGREGATE_LIGHT_COMPOSITE"
 LAADS_BASE = "https://ladsweb.modaps.eosdis.nasa.gov"
 
 USER_AGENT = f"viirs-nightlights-downloader/{__version__}"
+
+
+def write_qa_summary(qa_path, skill, command, args, bbox, output_paths):
+    """Write a JSON run-summary sidecar to qa_path (Phase 5 optimization)."""
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    summary = {
+        "skill": skill,
+        "command": command,
+        "version": __version__,
+        "user_agent": USER_AGENT,
+        "timestamp": _dt.now(_tz.utc).isoformat(),
+        "year": getattr(args, "year", None),
+        "product": getattr(args, "product", None),
+        "month": getattr(args, "month", None),
+        "preset": getattr(args, "preset", None),
+        "bbox": list(bbox) if bbox is not None else None,
+        "place": getattr(args, "place", None),
+        "output_paths": output_paths,
+        "output_dir": getattr(args, "output_dir", None),
+    }
+    qa_p = Path(qa_path)
+    qa_p.parent.mkdir(parents=True, exist_ok=True)
+    with open(qa_p, "w", encoding="utf-8") as f:
+        _json.dump(summary, f, ensure_ascii=False, indent=2)
 
 
 def validate_year(year: int) -> bool:
@@ -307,8 +365,67 @@ class ViirsDownloader:
         self.session.close()
 
 
+def resolve_args(args) -> tuple:
+    """Resolve --bbox / --place / --preset; fill in args.product if preset provides it.
+
+    Returns (bbox_or_None, source_label, error_code_or_None).
+    bbox_or_None means "no spatial filter" (global).
+    error_code: 0/None if OK; non-zero to signal an error to caller.
+    """
+    # Apply preset first
+    if getattr(args, "preset", None):
+        p = get_preset(args.preset)
+        for k, v in p.items():
+            if k == "description":
+                continue
+            current = getattr(args, k, None)
+            # product / bbox are easy to fill; bbox we apply after if no explicit
+            if k == "product" and current in (None, "annual"):
+                setattr(args, k, v)
+
+    # --bbox wins
+    if getattr(args, "bbox", None):
+        try:
+            bbox = parse_bbox(args.bbox)
+        except ValueError as e:
+            print(f"Error: Invalid bounding box: {e}", file=sys.stderr)
+            return None, "invalid", 1
+        if not validate_bbox(bbox):
+            print("Error: Invalid bounding box", file=sys.stderr)
+            return None, "invalid", 1
+        return bbox, f"--bbox {format_bbox(bbox)}", None
+
+    # --place
+    if getattr(args, "place", None):
+        try:
+            bbox = resolve_place(args.place)
+            return bbox, f"--place '{args.place}' → {format_bbox(bbox)}", None
+        except PlaceNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return None, "not_found", 1
+
+    # --preset only
+    if getattr(args, "preset", None):
+        p = get_preset(args.preset)
+        bbox = p.get("bbox")
+        if bbox is None:
+            return None, f"--preset '{args.preset}' (no spatial filter)", None
+        return bbox, f"--preset '{args.preset}' → {format_bbox(bbox)}", None
+
+    return None, "(no spatial filter — global data)", None
+
+
 def cmd_search(args):
     """Handle search command."""
+    bbox, source_label, err = resolve_args(args)
+    if err:
+        return err
+    # Diagnostic info on stderr (so stdout remains pure JSON for piping)
+    print(
+        f"Search: product={args.product} year={args.year} month={args.month or '-'} "
+        f"bbox={bbox} ({source_label})",
+        file=sys.stderr,
+    )
     downloader = ViirsDownloader(output_dir=args.output_dir or ".")
     try:
         results = downloader.search(
@@ -316,7 +433,11 @@ def cmd_search(args):
             product=args.product,
             month=args.month,
         )
-        print(json.dumps(results, indent=2))
+        if bbox is not None:
+            for r in results:
+                r["bbox_filter"] = list(bbox)
+                r["bbox_source"] = source_label
+        print(json.dumps(results, indent=2, ensure_ascii=False))
         return 0
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -331,18 +452,43 @@ def cmd_download(args):
         print(f"Error: Year must be between {MIN_YEAR} and {MAX_YEAR}", file=sys.stderr)
         return 1
 
+    bbox, source_label, err = resolve_args(args)
+    if err:
+        return err
+    print(
+        f"Download: product={args.product} year={args.year} month={args.month or '-'} "
+        f"bbox={bbox} ({source_label})",
+        file=sys.stderr,
+    )
+
+    # --list-urls: just print the URLs the user can grab with their EOG account
+    if args.list_urls:
+        rows = []
+        if args.product == "annual":
+            url = build_resource_url("annual", args.year)
+            rows.append({"year": args.year, "product": "annual", "month": None, "url": url})
+        elif args.product == "monthly":
+            months = [args.month] if args.month else range(1, 13)
+            for m in months:
+                url = build_resource_url("monthly", args.year, m)
+                rows.append({"year": args.year, "product": "monthly", "month": m, "url": url})
+        out_path = Path(args.list_urls)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        print(f"\n{len(rows)} URL(s) written to {out_path}")
+        print(
+            "Note: EOG requires a free account since 2025. "
+            "Use these URLs with `wget --user=...` or via the EOG browser."
+        )
+        return 0
+
     downloader = ViirsDownloader(
         output_dir=args.output_dir or ".",
         timeout=args.timeout,
     )
+    downloaded_paths = []
     try:
-        bbox = None
-        if args.bbox:
-            bbox = parse_bbox(args.bbox)
-            if not validate_bbox(bbox):
-                print("Error: Invalid bounding box", file=sys.stderr)
-                return 1
-
         if args.product == "annual":
             path = downloader.download_resource(
                 product="annual",
@@ -351,6 +497,7 @@ def cmd_download(args):
                 force=args.force,
             )
             print(f"Downloaded: {path}")
+            downloaded_paths.append(str(path))
         elif args.product == "monthly":
             months = [args.month] if args.month else range(1, 13)
             for m in months:
@@ -362,6 +509,19 @@ def cmd_download(args):
                     force=args.force,
                 )
                 print(f"Downloaded: {path}")
+                downloaded_paths.append(str(path))
+
+        # Phase 5: --qa sidecar summary
+        if args.qa:
+            write_qa_summary(
+                qa_path=args.qa,
+                skill="viirs-nightlights-download",
+                command="download",
+                args=args,
+                bbox=bbox,
+                output_paths=downloaded_paths,
+            )
+            print(f"QA: {args.qa}")
 
         return 0
     except Exception as e:
@@ -371,11 +531,43 @@ def cmd_download(args):
         downloader.close()
 
 
+def cmd_list_presets(args):
+    print(list_presets())
+
+
+def cmd_list_regions(args):
+    try:
+        from place_resolver import HARDCODED_BBOXES
+    except ImportError:
+        print("place_resolver.py missing", file=sys.stderr)
+        return
+    print(f"Offline region catalog ({len(HARDCODED_BBOXES)} entries):\n")
+    for key in sorted(HARDCODED_BBOXES.keys()):
+        bbox = HARDCODED_BBOXES[key]
+        print(f"  {key:<24} {format_bbox(bbox)}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="viirs-nightlights-download",
         description="Download VIIRS nighttime light composite data.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples (batch3 v0.2.0+):
+
+  # Preset: china-lights = annual VNL v2 over China bbox
+  %(prog)s download --preset china-lights --year 2023 -o china/
+
+  # --place: just say "北京市"
+  %(prog)s download --place "北京市" --year 2023 -o beijing/
+
+  # --bbox still works (highest priority)
+  %(prog)s download --bbox 100,20,120,40 --year 2023 -o region/
+
+  # Just list URLs (no download) — useful since EOG requires an account since 2025
+  %(prog)s download --preset china-lights --year 2023 --list-urls urls.json
+        """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -386,6 +578,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--year", type=int, required=True, help=f"Year ({MIN_YEAR}-{MAX_YEAR})")
     search_parser.add_argument("--product", choices=VALID_PRODUCTS, default="annual", help="Product type")
     search_parser.add_argument("--month", type=int, help="Month (1-12, for monthly product)")
+    search_parser.add_argument("--bbox", help="Bounding box: west,south,east,north")
+    search_parser.add_argument("--place", help="Place name (e.g. '北京市').")
+    search_parser.add_argument("--preset", choices=list(PRESETS.keys()),
+                                help="Apply a named preset (e.g. china-lights).")
     search_parser.add_argument("-o", "--output-dir", help="Output directory")
     search_parser.set_defaults(func=cmd_search)
 
@@ -395,10 +591,26 @@ def build_parser() -> argparse.ArgumentParser:
     dl_parser.add_argument("--product", choices=VALID_PRODUCTS, default="annual", help="Product type")
     dl_parser.add_argument("--month", type=int, help="Month (1-12, for monthly product)")
     dl_parser.add_argument("--bbox", help="Bounding box: west,south,east,north")
+    dl_parser.add_argument("--place", help="Place name (e.g. '北京市').")
+    dl_parser.add_argument("--preset", choices=list(PRESETS.keys()),
+                           help="Apply a named preset (e.g. china-lights).")
     dl_parser.add_argument("-o", "--output-dir", default=".", help="Output directory")
     dl_parser.add_argument("--timeout", type=int, default=120, help="Download timeout in seconds")
     dl_parser.add_argument("--force", action="store_true", help="Overwrite existing files")
+    dl_parser.add_argument("--list-urls", metavar="FILE",
+                           help="Write JSON of download URLs to FILE (no actual download). "
+                                "Useful since EOG requires a free account since 2025.")
+    dl_parser.add_argument("--qa", metavar="PATH", default=None,
+                           help="Write a JSON run-summary sidecar to PATH (e.g. --qa run.qa.json).")
     dl_parser.set_defaults(func=cmd_download)
+
+    # list-presets
+    lp = subparsers.add_parser("list-presets", help="List available --preset names")
+    lp.set_defaults(func=cmd_list_presets)
+
+    # list-regions
+    lr = subparsers.add_parser("list-regions", help="List offline-baked region names")
+    lr.set_defaults(func=cmd_list_regions)
 
     return parser
 

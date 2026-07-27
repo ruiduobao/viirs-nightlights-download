@@ -1,0 +1,161 @@
+"""place_resolver.py — Phase 1+ adapter shim
+
+委托给 vendored _geoskill_core.aoi。返回 (W, S, E, N) tuple，保留老接口。
+
+替代 6 份原始 place_resolver.py：fire-hotspot-download, gee-dataset-intelligence,
+modis-lst-download, rs-metadata-crawler, stac-search, viirs-nightlights-download。
+"""
+from __future__ import annotations
+import os
+import sys
+from typing import Tuple
+
+# 优先用 _geoskill_core.aoi
+_SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_GEOSKILL_CORE_DIR = os.path.join(_SKILL_DIR, "_geoskill_core")
+if os.path.isdir(_GEOSKILL_CORE_DIR) and _GEOSKILL_CORE_DIR not in sys.path:
+    sys.path.insert(0, _GEOSKILL_CORE_DIR)
+try:
+    import aoi as _geoskill_aoi
+    _USE_CORE = True
+except Exception:  # noqa: BLE001
+    _geoskill_aoi = None
+    _USE_CORE = False
+
+
+# ---- HARDCODED_BBOXES（保留与老实现兼容的 28+ 中国 + 全球）----
+HARDCODED_BBOXES = {
+    "中国": (73.0, 18.0, 135.0, 54.0),
+    "china": (73.0, 18.0, 135.0, 54.0),
+    "cn": (73.0, 18.0, 135.0, 54.0),
+    "北京": (115.7, 39.4, 116.7, 40.2),
+    "北京市": (115.7, 39.4, 116.7, 40.2),
+    "beijing": (115.7, 39.4, 116.7, 40.2),
+    "上海": (120.8, 30.7, 122.2, 31.6),
+    "上海市": (120.8, 30.7, 122.2, 31.6),
+    "shanghai": (120.8, 30.7, 122.2, 31.6),
+    "天津": (116.7, 38.5, 118.1, 40.2),
+    "天津 市": (116.7, 38.5, 118.1, 40.2),
+    "重庆": (105.5, 28.5, 110.5, 32.0),
+    "重庆市": (105.5, 28.5, 110.5, 32.0),
+    "成都": (102.9, 30.1, 104.9, 31.5),
+    "成都市": (102.9, 30.1, 104.9, 31.5),
+    "chengdu": (102.9, 30.1, 104.9, 31.5),
+    "广州": (112.9, 22.4, 114.0, 23.9),
+    "广州市": (112.9, 22.4, 114.0, 23.9),
+    "深圳": (113.7, 22.4, 114.6, 22.9),
+    "深圳市": (113.7, 22.4, 114.6, 22.9),
+    "杭州": (118.3, 29.8, 120.5, 30.6),
+    "杭州市": (118.3, 29.8, 120.5, 30.6),
+    "南京": (118.3, 31.2, 119.2, 32.6),
+    "武汉市": (113.7, 29.9, 115.1, 31.4),
+    "西安": (107.9, 33.7, 109.8, 34.7),
+    "西安市": (107.9, 33.7, 109.8, 34.7),
+    "world": (-180.0, -90.0, 180.0, 90.0),
+    "global": (-180.0, -90.0, 180.0, 90.0),
+    "usa": (-125.0, 24.0, -66.0, 50.0),
+    "japan": (130.0, 30.0, 146.0, 46.0),
+    "日本": (130.0, 30.0, 146.0, 46.0),
+    "europe": (-10.0, 35.0, 40.0, 70.0),
+    "欧洲": (-10.0, 35.0, 40.0, 70.0),
+    # 水系 / 流域（modis-lst 等老实现里包含）
+    "长江流域": (90.0, 25.0, 122.0, 35.0),
+    "长江": (90.0, 25.0, 122.0, 35.0),
+    "黄河流域": (95.0, 32.0, 119.0, 42.0),
+    "黄河": (95.0, 32.0, 119.0, 42.0),
+    "珠江流域": (100.0, 21.0, 117.0, 26.5),
+    "珠江": (100.0, 21.0, 117.0, 26.5),
+    "京津冀": (113.0, 38.0, 119.5, 41.5),
+    "长三角": (118.0, 28.5, 122.5, 33.0),
+    "珠三角": (112.5, 21.5, 114.5, 24.0),
+    "宁夏": (104.0, 35.0, 107.5, 39.5),
+}
+
+
+# ---- PlaceNotFoundError（保留老异常类）----
+class PlaceNotFoundError(ValueError):
+    """place 解析失败时抛（保留与老实现兼容）"""
+    def __init__(self, query, candidates=None):
+        msg = f"无法解析地点: {query!r}"
+        if candidates:
+            msg += f" (candidates: {candidates})"
+        super().__init__(msg)
+        self.query = query
+        self.candidates = candidates or []
+
+
+# ---- PRESETS（保留与老实现兼容的简单 dict）----
+PRESETS = {
+    "china-fires": {"bbox": (73.0, 18.0, 135.0, 54.0), "description": "中国全境火点"},
+    "yangtze-fires": {"bbox": (90.0, 25.0, 122.0, 35.0), "description": "长江流域"},
+    "global-fires": {"bbox": (-180.0, -55.0, 180.0, 75.0), "description": "全球火点"},
+    "global-lst": {"bbox": (-180.0, -55.0, 180.0, 75.0), "description": "全球 LST"},
+    "china-lst": {"bbox": (73.0, 18.0, 135.0, 54.0), "description": "中国 LST"},
+    "city-uhi": {"bbox": (115.0, 39.0, 117.0, 41.0), "description": "城市热岛"},
+    "flood-2024": {"bbox": (110.0, 30.0, 122.0, 38.0), "description": "2024 洪涝"},
+    "deformation-ningxia": {"bbox": (105.0, 35.0, 107.5, 39.0), "description": "宁夏形变"},
+    "beijing-2024": {"bbox": (115.7, 39.4, 116.7, 40.2), "description": "北京 2024"},
+    "china-crops": {"bbox": (73.0, 18.0, 135.0, 54.0), "description": "中国农作物"},
+}
+
+
+# ---- resolve_place 主入口 ----
+
+def resolve_place(place: str, buffer_deg: float = 0.0, use_nominatim: bool = True, **kwargs) -> Tuple[float, float, float, float]:
+    """Resolve a place name to a bbox (W, S, E, N).
+
+    与老 place_resolver.py 接口兼容：
+    - buffer_deg: 在 hardcoded bbox 周围扩展（默认 0 — 老实现 hardcoded 命中也不加 buffer）
+    - use_nominatim: 是否允许在线 fallback（默认 True，向下兼容老 API）
+    - 其它 kwargs 忽略
+
+    Returns:
+        (W, S, E, N) tuple（精度 round 到 6 位，避免浮点误差）
+
+    Raises:
+        PlaceNotFoundError: 解析失败
+    """
+    if not place or not place.strip():
+        raise PlaceNotFoundError(place)
+    # 1. 硬编码（命中后按 buffer_deg 扩展，保持向后兼容）
+    if place in HARDCODED_BBOXES:
+        w, s, e, n = HARDCODED_BBOXES[place]
+        bbox = (w - buffer_deg, s - buffer_deg, e + buffer_deg, n + buffer_deg)
+        return tuple(round(x, 6) for x in bbox)  # type: ignore[return-value]
+    # 2. 委托 geoskill_core
+    if _USE_CORE and _geoskill_aoi is not None:
+        try:
+            m = _geoskill_aoi.resolve_place(place, buffer_deg=buffer_deg, allow_nominatim=use_nominatim, use_cache=False)
+            if m and m.bbox_wgs84 and len(m.bbox_wgs84) == 4:
+                return tuple(round(x, 6) for x in m.bbox_wgs84)  # type: ignore[return-value]
+        except Exception:
+            pass
+    # 3. 兜底硬编码
+    raise PlaceNotFoundError(place)
+
+
+def get_preset(name: str) -> dict:
+    if name not in PRESETS:
+        raise ValueError(f"Unknown preset: {name}")
+    return PRESETS[name]
+
+
+def list_presets() -> str:
+    lines = ["Available presets:"]
+    for k, v in PRESETS.items():
+        desc = v.get("description", "")
+        lines.append(f"  {k}: {desc}")
+    return "\n".join(lines)
+
+
+def format_bbox(b) -> str:
+    if not b or len(b) != 4:
+        return str(b)
+    return f"{b[0]} {b[1]} {b[2]} {b[3]}"
+
+
+__all__ = [
+    "HARDCODED_BBOXES", "PRESETS",
+    "PlaceNotFoundError", "resolve_place",
+    "get_preset", "list_presets", "format_bbox",
+]
